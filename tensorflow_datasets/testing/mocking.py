@@ -205,7 +205,7 @@ def mock_data(
         output_shapes=tf.nest.map_structure(lambda t: t.shape, specs),
     )
     ds = ds.apply(tf.data.experimental.assert_cardinality(num_examples))
-    ds.map(decode_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    ds = ds.map(decode_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
     if read_config and read_config.add_tfds_id:
       ds_id = tfrecords_reader._make_id_dataset(  # pylint: disable=protected-access
