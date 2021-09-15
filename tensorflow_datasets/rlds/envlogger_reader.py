@@ -15,7 +15,7 @@
 
 """Utils to read envlogger data into a dataset that is compatible with RLDS."""
 
-from typing import AbstractSet, Any, Callable, Dict, Generator, List, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Sequence, Tuple, Union
 
 import numpy as np
 import tensorflow as tf
@@ -41,15 +41,11 @@ def get_episode_metadata(
   return custom_data.get('episode_metadata', {}) if custom_data else {}
 
 
-def get_step_metadata(
-    step: Any,
-    step_metadata_skip_list: AbstractSet[str] = frozenset()
-) -> Dict[str, Any]:
+def get_step_metadata(step: Any) -> Dict[str, Any]:
   """Extracts the custom metadata from the step.
 
   Args:
     step: step data (envlogger.StepData).
-    step_metadata_skip_list: Set of metadata keys to filter.
 
   Returns:
     Dictionary containing the step metadata.
@@ -57,17 +53,55 @@ def get_step_metadata(
   if not isinstance(step.custom_data, dict):
     # We ignore step metadata if step.custom_data is not a dictionary
     return {}
-  return {
-      k: v
-      for k, v in step.custom_data.items()
-      if k != 'episode_metadata' and k not in step_metadata_skip_list
-  }
+  return {k: v for k, v in step.custom_data.items()}
+
+
+def get_episode_dict(episode: Sequence[Any],
+                     episode_metadata: Dict[str, Any],
+                     keep_episode_fn: Callable[[Dict[str, Any]],
+                                               bool] = lambda x: True,
+                     step_fn: Callable[[Dict[str, Any]],
+                                       Dict[str, Any]] = lambda x: x,
+                     episode_fn: Callable[[Dict[str, Any]],
+                                          Dict[str, Any]] = lambda x: x,
+                     steps_to_ds=False) -> Tuple[Dict[str, Any], bool]:
+  """Obtains an RLDS episode from an Envlogger episode.
+
+  Args:
+    episode: sequence of envlogger.StepData.
+    episode_metadata: metadata as obtained from the envlogger reader.
+    keep_episode_fn: function to apply to the episode metadata to decide if the
+      episode has to be kept.
+    step_fn: functiont hat processes each RLDS step once it's built from the raw
+      data.
+    episode_fn: function that processes each RLDS episode once it's built from
+      the raw data.
+    steps_to_ds: if True, the steps in the episode are coverted to a
+      `tf.data.Dataset`.
+
+  Returns:
+     Tuple of an episode and a boolean indicating if the episode is valid.
+  """
+  if episode_metadata:
+    episode_dict = episode_metadata
+  else:
+    episode_dict = get_episode_metadata(episode)
+  if not keep_episode_fn(episode_dict):
+    return ({}, False)
+  steps = _generate_steps(episode, step_fn)
+
+  if steps_to_ds:
+    steps = tf.data.Dataset.from_tensor_slices(steps)
+  episode_dict['steps'] = steps
+  episode_dict = episode_fn(episode_dict)
+  return (episode_dict, True)
 
 
 def generate_episodes(
     tag_reader: Any,
     keep_episode_fn: Callable[[Dict[str, Any]], bool] = lambda x: True,
-    step_metadata_skip_list: AbstractSet[str] = frozenset(),
+    step_fn: Callable[[Dict[str, Any]], Dict[str, Any]] = lambda x: x,
+    episode_fn: Callable[[Dict[str, Any]], Dict[str, Any]] = lambda x: x,
     steps_to_ds=False) -> Generator[Dict[str, Any], None, None]:
   """Generates episodes by reading them from the tag_reader.
 
@@ -76,8 +110,9 @@ def generate_episodes(
     keep_episode_fn: function that receives an episode and returns a boolean,
       acting as a filter (true if we want to keep this episodes, false if we
       want to skip it).
-    step_metadata_skip_list: list of fields of the step's metadata that will not
-      be included in the result.
+    step_fn: function that gets an RLDS step and returns the processed step.
+    episode_fn: function that gets the RLDS episode and returns the processed
+      episode.
     steps_to_ds: if True, the steps of each episode are returned as a nested
       dataset.
 
@@ -86,84 +121,100 @@ def generate_episodes(
   """
   for index, episode_metadata in enumerate(tag_reader.episode_metadata()):
     episode = tag_reader.episodes[index]
-    if episode_metadata:
-      episode_dict = episode_metadata
-    else:
-      episode_dict = get_episode_metadata(episode)
-    if not keep_episode_fn(episode_dict):
-      continue
-    steps = _generate_steps(episode, step_metadata_skip_list)
+    episode_dict, keep = get_episode_dict(episode, episode_metadata,
+                                          keep_episode_fn, step_fn, episode_fn,
+                                          steps_to_ds)
+    if keep:
+      yield episode_dict
 
-    if steps_to_ds:
-      steps = tf.data.Dataset.from_tensor_slices(steps)
-    episode_dict['steps'] = steps
-    yield episode_dict
+
+def _build_empty_step(
+    step: Any, step_fn: Callable[[Dict[str, Any]],
+                                 Dict[str, Any]]) -> Dict[str, Any]:
+  """Builds a step with the same shape and dtype of an RLDS step."""
+  #  Although some of the fields main contain data, it should be used as a step
+  # containing non-defined data to get the shape and the dtype of the RLDS step.
+  rlds_step = get_step_metadata(step)
+  rlds_step['observation'] = step.timestep.observation
+  rlds_step['action'] = step.action
+  rlds_step['reward'] = step.timestep.reward
+  rlds_step['discount'] = step.timestep.discount
+  rlds_step['is_terminal'] = False
+  rlds_step['is_first'] = False
+  rlds_step['is_last'] = False
+
+  return step_fn(rlds_step)
+
+
+def _build_step(
+    prev_step: Any, step: Any,
+    step_fn: Callable[[Dict[str, Any]], Dict[str, Any]]) -> Dict[str, Any]:
+  """Builds an RLDS step from two envlogger steps."""
+  rlds_step = get_step_metadata(prev_step)
+  rlds_step['observation'] = prev_step.timestep.observation
+  rlds_step['action'] = step.action
+  rlds_step['reward'] = step.timestep.reward
+  rlds_step['discount'] = step.timestep.discount
+  rlds_step['is_terminal'] = False
+  rlds_step['is_first'] = prev_step.timestep.first()
+  rlds_step['is_last'] = prev_step.timestep.last()
+
+  return step_fn(rlds_step)
+
+
+def _build_last_step(
+    prev_step: Any, step_fn: Callable[[Dict[str, Any]],
+                                      Dict[str, Any]]) -> Dict[str, Any]:
+  """Builds the last RLDS step from an envlogger step."""
+  # We append the observation of the final step (action and reward were
+  # included in the previous step.
+  # The terminal flag is inferred like in termination(), truncation()
+  # from dm_env/_environment.py
+  is_terminal = (
+      prev_step.timestep.last() and prev_step.timestep.discount == 0.0)
+  rlds_step = get_step_metadata(prev_step)
+  rlds_step['observation'] = prev_step.timestep.observation
+  rlds_step['is_terminal'] = is_terminal
+  rlds_step['is_first'] = prev_step.timestep.first()
+  rlds_step['is_last'] = True
+  # Discount, action and reward are meaningless in the terminal step
+  rlds_step['action'] = tf.nest.map_structure(np.zeros_like, prev_step.action)
+  rlds_step['reward'] = np.zeros_like(prev_step.timestep.reward)
+  rlds_step['discount'] = np.zeros_like(prev_step.timestep.discount)
+
+  return step_fn(rlds_step)
 
 
 def _generate_steps(
     episode: Sequence[Any],
-    step_metadata_skip_list: AbstractSet[str]) -> Dict[str, Any]:
+    step_fn: Callable[[Dict[str, Any]], Dict[str, Any]]) -> Dict[str, Any]:
   """Constructs a dictionary of steps for the given episode.
 
   Args:
-    episode: Sequence of steps (envlogger.StepData).
-    step_metadata_skip_list: Set of metadata keys to filter.
+    episode: Sequence of steps (envlogger.StepData). Assumes that there are at
+      least two steps.
+    step_fn: function that gets an RLDS step and returns the processed step.
 
   Returns:
     Nested dictionary with the steps of one episode.
   """
-  step_metadata = _empty_nested_list(
-      get_step_metadata(episode[0], step_metadata_skip_list))
-
-  steps = {
-      'observation':
-          _empty_nested_list(episode[0].timestep.observation),
-      'action':
-          _empty_nested_list(episode[0].action),
-      'reward': [],
-      'discount': [],
-      'is_terminal': [],
-      'is_first': [],
-      'is_last': [],
-  }
-  steps.update(step_metadata)
+  if len(episode) < 2:
+    step = _build_last_step(episode[0], step_fn)
+    return _to_nested_list(step)
+  empty_step = _build_empty_step(episode[1], step_fn)
+  steps = {k: _empty_nested_list(v) for k, v in empty_step.items()}
 
   prev_step = None
   for step in episode:
     if prev_step is not None:
-      steps['is_first'].append(prev_step.timestep.first())
-      steps['is_terminal'].append(False)
-      steps['is_last'].append(prev_step.timestep.last())
-      steps['observation'] = _append_nested(
-          steps['observation'], prev_step.timestep.observation)
-      steps['reward'].append(step.timestep.reward)
-      steps['discount'].append(step.timestep.discount)
-      steps['action'] = _append_nested(steps['action'], step.action)
-      step_metadata = get_step_metadata(prev_step, step_metadata_skip_list)
-      for k, v in step_metadata.items():
+      rlds_step = _build_step(prev_step, step, step_fn)
+      for k, v in rlds_step.items():
         steps[k] = _append_nested(steps[k], v)
     prev_step = step
+
   if prev_step is not None:
-    # We append the observation of the final step (action and reward were
-    # included in the previous step.
-    # The terminal flag is inferred like in termination(), truncation()
-    # from dm_env/_environment.py
-    is_terminal = (
-        prev_step.timestep.last() and prev_step.timestep.discount == 0.0)
-    steps['is_first'].append(prev_step.timestep.first())
-    steps['is_terminal'].append(is_terminal)
-    steps['is_last'].append(True)
-    steps['observation'] = _append_nested(
-        steps['observation'], prev_step.timestep.observation)
-    # Discount, action and reward are meaningless in the terminal step
-    steps['reward'].append(np.zeros_like(prev_step.timestep.reward))
-    steps['discount'].append(
-        np.zeros_like(prev_step.timestep.discount))
-    steps['action'] = _append_nested(
-        steps['action'],
-        tf.nest.map_structure(np.zeros_like, prev_step.action))
-    step_metadata = get_step_metadata(prev_step, step_metadata_skip_list)
-    for k, v in step_metadata.items():
+    last_step = _build_last_step(prev_step, step_fn)
+    for k, v in last_step.items():
       steps[k] = _append_nested(steps[k], v)
   return steps
 
@@ -197,21 +248,52 @@ def _append_nested(
     return collection
 
 
-def _empty_nested_list(
-    data: Union[np.ndarray, List[Any], Tuple[Any, ...], Dict[str, Any]]
-) -> Union[List[Any], Tuple[Any, ...], Dict[str, Any]]:
-  """Creates an element like data but with empty lists in the nested dimensions.
+def _apply_recursive(
+    data: Union[np.ndarray, List[Any], Tuple[Any, ...], Dict[str, Any]],
+    fn: Callable[[Any],
+                 Any]) -> Union[List[Any], Tuple[Any, ...], Dict[str, Any]]:
+  """Applies a function recursively to the nested dimensions of the input.
 
   Args:
     data: scalar, array, list, tuple or dictionary.
+    fn: function to apply to the most nested dimension.
+
+  Returns:
+    item with the same shape of data but with fn applied to the most nested
+    dimension
+  """
+  if isinstance(data, dict):
+    return {k: _apply_recursive(data[k], fn) for k in data}
+  elif isinstance(data, tuple):
+    return tuple(_apply_recursive(x, fn) for x in data)
+  else:
+    return fn(data)
+
+
+def _empty_nested_list(data: Dict[str, Any]) -> Dict[str, Any]:
+  """Creates an element like data but with empty lists in the nested dimensions.
+
+  Args:
+    data: dictionary.
 
   Returns:
     item with the same shape of data but with empty lists in its nested
     dimensions.
   """
-  if isinstance(data, dict):
-    return {k: _empty_nested_list(data[k]) for k in data}
-  elif isinstance(data, tuple):
-    return tuple(_empty_nested_list(x) for x in data)
-  else:
-    return []
+
+  return {k: _apply_recursive(v, lambda x: []) for k, v in data.items()}
+
+
+def _to_nested_list(data: Dict[str, Any]) -> Dict[str, Any]:
+  """Transforms data to lists of length 1 in the nested dimensions.
+
+  Args:
+    data: dictionary.
+
+  Returns:
+    item with the same shape of data but with lists of length 1 in its nested
+    dimensions.
+  """
+  return {
+      k : _apply_recursive(v, lambda x: [x]) for k,v in data.items()
+    }
